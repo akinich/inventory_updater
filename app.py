@@ -1,6 +1,3 @@
-Here’s the full updated script with the restructured read-only table, two editable input columns for new values, correct variation updates, and a static table loaded from `item_database.xlsx` filtered by `ID`.
-
-```python
 import streamlit as st
 import requests
 import pandas as pd
@@ -220,4 +217,3 @@ if st.session_state["products_df"] is not None:
                 st.success(f"Updated {updated} item(s) successfully.")
             if failed:
                 st.error("Some updates failed:\n" + "\n".join(failed))
-```
