@@ -1,16 +1,3 @@
-I'll outline the tasks to update your Streamlit app (variation endpoint, editor config, selection, safe coercion, manage_stock, validation, secrets check, and improved errors), then implement all changes in the revised code.
-
-[1 tool called]
-
-I’m going to implement all requested fixes in your Streamlit code: correct variation update endpoint, configure the data editor properly with disabled columns, add a selection checkbox, safely coerce values, ensure stock management is enabled when updating stock, validate the product ID, verify secrets are present, and improve error messages.
-
-[1 tool called]
-
-- I validated secrets, product ID input, corrected the variation update endpoint, switched to `column_config` with disabled columns, added a selection column, added safe coercion for numbers/empties, set `manage_stock` when updating stock, and improved error reporting.
-
-Here’s the revised code. It keeps your structure but fixes the issues:
-
-```python
 import streamlit as st
 import requests
 import pandas as pd
@@ -202,6 +189,3 @@ if st.button("Fetch Product") and product_id_input:
                             st.error("Some updates failed:\n" + "\n".join(failed))
             else:
                 st.info("No product found.")
-```
-
-- All tasks have been completed and reflected in the code.
