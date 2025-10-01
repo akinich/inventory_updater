@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 
 st.set_page_config(page_title="WooCommerce Product Lookup & Update", layout="wide")
-st.title("WooCommerce Product Lookup & Update by ID")
+st.title("WooCommerce Product Lookup & Inline Update")
 
 # WooCommerce API credentials
 WC_API_URL = st.secrets.get("WC_API_URL", "https://sustenance.co.in/wp-json/wc/v3")
@@ -13,7 +13,7 @@ WC_CONSUMER_SECRET = st.secrets.get("WC_CONSUMER_SECRET")
 # ------------------- FETCH PRODUCT -------------------
 st.header("Fetch Product Details")
 
-product_id = st.text_input("Enter Product ID to Fetch:")
+product_id = st.text_input("Enter Product ID:")
 
 if st.button("Fetch Product") and product_id:
     with st.spinner("Fetching product..."):
@@ -33,9 +33,9 @@ if st.button("Fetch Product") and product_id:
                 "ID": p.get("id"),
                 "Parent ID": None,
                 "Product Name": p.get("name"),
-                "Current Stock": p.get("stock_quantity"),
-                "Sale Price": p.get("sale_price"),
-                "Regular Price": p.get("regular_price")
+                "Current Stock": p.get("stock_quantity") or 0,
+                "Sale Price": p.get("sale_price") or "",
+                "Regular Price": p.get("regular_price") or ""
             }
             all_rows.append(base_info)
 
@@ -62,9 +62,9 @@ if st.button("Fetch Product") and product_id:
                             "ID": v.get("id"),
                             "Parent ID": p.get("id"),
                             "Product Name": v.get("name") or p.get("name"),
-                            "Current Stock": v.get("stock_quantity"),
-                            "Sale Price": v.get("sale_price"),
-                            "Regular Price": v.get("regular_price")
+                            "Current Stock": v.get("stock_quantity") or 0,
+                            "Sale Price": v.get("sale_price") or "",
+                            "Regular Price": v.get("regular_price") or ""
                         }
                         all_rows.append(var_info)
 
@@ -72,44 +72,41 @@ if st.button("Fetch Product") and product_id:
 
             if all_rows:
                 df = pd.DataFrame(all_rows)
-                st.dataframe(df, use_container_width=True)
+                st.subheader("Product Table (Edit Stock & Sale Price)")
+                edited_df = st.data_editor(
+                    df,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    columns={
+                        "ID": {"editable": False},
+                        "Parent ID": {"editable": False},
+                        "Product Name": {"editable": False},
+                        "Regular Price": {"editable": False},
+                        "Current Stock": {"editable": True},
+                        "Sale Price": {"editable": True},
+                    }
+                )
+
+                # ------------------- UPDATE PRODUCTS -------------------
+                if st.button("Update Selected Products"):
+                    updated_count = 0
+                    for _, row in edited_df.iterrows():
+                        product_data = {
+                            "stock_quantity": int(row["Current Stock"]),
+                            "sale_price": str(row["Sale Price"])
+                        }
+
+                        resp = requests.put(
+                            f"{WC_API_URL}/products/{row['ID']}",
+                            json=product_data,
+                            auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+                        )
+
+                        if resp.status_code in [200, 201]:
+                            updated_count += 1
+                        else:
+                            st.error(f"Failed to update Product ID {row['ID']}: {resp.text}")
+
+                    st.success(f"Updated {updated_count} product(s) successfully!")
             else:
                 st.info("No product found.")
-
-# ------------------- UPDATE PRODUCT -------------------
-st.header("Update Stock & Sale Price")
-
-update_product_id = st.text_input("Enter Product/Variation ID to Update:")
-new_stock = st.text_input("Enter New Stock Quantity:")
-new_sale_price = st.text_input("Enter New Sale Price (leave blank if no change)")
-
-if st.button("Update Product"):
-    if not update_product_id:
-        st.error("Please enter a Product/Variation ID to update.")
-    else:
-        data = {}
-        if new_stock:
-            try:
-                data["stock_quantity"] = int(new_stock)
-            except ValueError:
-                st.error("Stock must be an integer.")
-        if new_sale_price:
-            try:
-                data["sale_price"] = str(new_sale_price)
-            except ValueError:
-                st.error("Sale Price must be a number.")
-
-        if data:
-            update_resp = requests.put(
-                f"{WC_API_URL}/products/{update_product_id}",
-                json=data,
-                auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
-            )
-
-            if update_resp.status_code in [200, 201]:
-                st.success(f"Product {update_product_id} updated successfully.")
-                st.json(update_resp.json())
-            else:
-                st.error(f"Failed to update: {update_resp.status_code} - {update_resp.text}")
-        else:
-            st.info("No changes to update.")
