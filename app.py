@@ -105,7 +105,7 @@ def fetch_products_for_ids(source_ids):
                     "Current Stock": v.get("stock_quantity") or 0,
                     "Sale Price": v.get("sale_price") or "",
                     "Regular Price": v.get("regular_price") or "",
-                    "Type": v.get("type") or "variation",
+                    "Type": "variation",
                     "New Sale Price": "",
                     "New Stock Quantity": "",
                 })
@@ -136,6 +136,7 @@ def coerce_price(value):
     s = str(value).strip()
     return "" if s.lower() == "nan" else s
 
+# Initialize session state
 if "products_df" not in st.session_state:
     st.session_state["products_df"] = None
 if "manage_stock_map" not in st.session_state:
@@ -162,10 +163,7 @@ if refresh_clicked:
         with st.spinner("Fetching latest data from WooCommerce..."):
             rows, manage_map, missing_ids = fetch_products_for_ids(ids)
             if rows:
-                df = pd.DataFrame(rows, columns=[
-                    "ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type",
-                    "New Sale Price", "New Stock Quantity"
-                ])
+                df = pd.DataFrame(rows)
                 st.session_state["products_df"] = df
                 st.session_state["manage_stock_map"] = manage_map
                 st.session_state["missing_ids"] = missing_ids
@@ -178,17 +176,18 @@ if st.session_state["products_df"] is not None:
         st.session_state["products_df"],
         use_container_width=True,
         column_config={
-            "ID": st.column_config.TextColumn("ID"),
-            "Parent ID": st.column_config.TextColumn("Parent ID"),
-            "Product Name": st.column_config.TextColumn("Product Name"),
-            "Current Stock": st.column_config.TextColumn("Current Stock"),
-            "Sale Price": st.column_config.TextColumn("Sale Price"),
-            "Regular Price": st.column_config.TextColumn("Regular Price"),
-            "Type": st.column_config.TextColumn("Type"),
+            "ID": st.column_config.NumberColumn("ID", disabled=True, format="%d"),
+            "Parent ID": st.column_config.NumberColumn("Parent ID", disabled=True, format="%d"),
+            "Product Name": st.column_config.TextColumn("Product Name", disabled=True),
+            "Current Stock": st.column_config.NumberColumn("Current Stock", disabled=True),
+            "Sale Price": st.column_config.TextColumn("Sale Price", disabled=True),
+            "Regular Price": st.column_config.TextColumn("Regular Price", disabled=True),
+            "Type": st.column_config.TextColumn("Type", disabled=True),
             "New Sale Price": st.column_config.TextColumn("New Sale Price", help="Leave blank to skip"),
-            "New Stock Quantity": st.column_config.TextColumn("New Stock Quantity", help="Leave blank to skip"),
+            "New Stock Quantity": st.column_config.NumberColumn("New Stock Quantity", help="Leave blank to skip"),
         },
-        disabled=["ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"],
+        hide_index=True,
+        key="product_editor"
     )
 
     if update_clicked:
@@ -199,50 +198,65 @@ if st.session_state["products_df"] is not None:
             failed = []
             stock_not_managed = []
 
-            for _, row in edited_df.iterrows():
-                prod_id = int(row["ID"])
-                parent_id = row.get("Parent ID")
-                parent_missing = parent_id is None or (isinstance(parent_id, float) and math.isnan(parent_id)) or parent_id == ""
-                new_price = coerce_price(row.get("New Sale Price"))
-                new_stock = coerce_int(row.get("New Stock Quantity"))
+            with st.spinner("Updating products..."):
+                for _, row in edited_df.iterrows():
+                    prod_id = int(row["ID"])
+                    parent_id = row.get("Parent ID")
+                    
+                    # Check if parent_id is valid (not NaN, None, or empty)
+                    parent_missing = (
+                        parent_id is None or 
+                        (isinstance(parent_id, float) and math.isnan(parent_id)) or 
+                        parent_id == ""
+                    )
+                    
+                    new_price = coerce_price(row.get("New Sale Price"))
+                    new_stock = coerce_int(row.get("New Stock Quantity"))
 
-                payload = {}
+                    payload = {}
 
-                if new_price != "":
-                    payload["sale_price"] = new_price
+                    if new_price != "":
+                        payload["sale_price"] = new_price
 
-                if new_stock is not None:
-                    manage_stock = bool(st.session_state["manage_stock_map"].get(prod_id, False))
-                    if not manage_stock:
-                        stock_not_managed.append(prod_id)
+                    if new_stock is not None:
+                        manage_stock = bool(st.session_state["manage_stock_map"].get(prod_id, False))
+                        if not manage_stock:
+                            stock_not_managed.append(prod_id)
+                        else:
+                            payload["stock_quantity"] = new_stock
+
+                    if not payload:
+                        continue
+
+                    # Determine correct API endpoint
+                    if parent_missing:
+                        target_url = f"{WC_API_URL}/products/{prod_id}"
                     else:
-                        payload["stock_quantity"] = new_stock
+                        target_url = f"{WC_API_URL}/products/{int(parent_id)}/variations/{prod_id}"
 
-                if not payload:
-                    continue
-
-                target_url = (
-                    f"{WC_API_URL}/products/{prod_id}"
-                    if parent_missing
-                    else f"{WC_API_URL}/products/{int(parent_id)}/variations/{prod_id}"
-                )
-
-                try:
-                    r = requests.put(target_url, json=payload, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30)
-                    if r.status_code in (200, 201):
-                        updated_count += 1
-                    else:
-                        failed.append(f"ID {prod_id} (HTTP {r.status_code}): {r.text[:300]}")
-                except Exception as e:
-                    failed.append(f"ID {prod_id} (exception): {str(e)}")
+                    try:
+                        r = requests.put(
+                            target_url, 
+                            json=payload, 
+                            auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), 
+                            timeout=30
+                        )
+                        if r.status_code in (200, 201):
+                            updated_count += 1
+                        else:
+                            failed.append(f"ID {prod_id} (HTTP {r.status_code}): {r.text[:300]}")
+                    except Exception as e:
+                        failed.append(f"ID {prod_id} (exception): {str(e)}")
 
             if updated_count:
-                st.success(f"Updated {updated_count} item(s) successfully.")
+                st.success(f"✅ Updated {updated_count} item(s) successfully.")
             if stock_not_managed:
-                st.error("Stock not managed for ID(s): " + ", ".join(str(i) for i in sorted(set(stock_not_managed))))
+                st.warning(f"⚠️ Stock not managed for ID(s): {', '.join(str(i) for i in sorted(set(stock_not_managed)))}")
             if failed:
-                st.error("Some updates failed:\n" + "\n".join(failed))
+                with st.expander("❌ Failed Updates", expanded=True):
+                    for error in failed:
+                        st.error(error)
 
 if st.session_state["missing_ids"]:
-    st.subheader("IDs not found on website")
-    st.write(", ".join(str(i) for i in st.session_state["missing_ids"]))
+    st.subheader("⚠️ IDs not found on website")
+    st.warning(", ".join(str(i) for i in st.session_state["missing_ids"]))
