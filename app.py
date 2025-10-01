@@ -11,39 +11,9 @@ WC_API_URL = st.secrets.get("WC_API_URL", "https://sustenance.co.in/wp-json/wc/v
 WC_CONSUMER_KEY = st.secrets.get("WC_CONSUMER_KEY")
 WC_CONSUMER_SECRET = st.secrets.get("WC_CONSUMER_SECRET")
 
-# Guard: secrets required
 if not WC_CONSUMER_KEY or not WC_CONSUMER_SECRET:
     st.error("WooCommerce credentials are missing. Please set WC_CONSUMER_KEY and WC_CONSUMER_SECRET in secrets.")
     st.stop()
-
-st.header("Fetch Product Details")
-
-product_id_input = st.text_input("Enter Product ID:")
-
-def is_nan_or_empty(value):
-    if value is None:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return True
-    if isinstance(value, str) and value.strip() == "":
-        return True
-    return False
-
-def coerce_int_or_none(value):
-    try:
-        if is_nan_or_empty(value):
-            return None
-        return int(float(str(value).strip()))
-    except Exception:
-        return None
-
-def coerce_price_or_empty(value):
-    if is_nan_or_empty(value):
-        return ""
-    s = str(value).strip()
-    if s.lower() == "nan":
-        return ""
-    return s
 
 @st.cache_data(show_spinner=False)
 def load_item_database():
@@ -52,6 +22,9 @@ def load_item_database():
         if "ID" not in df.columns:
             st.warning("item_database.xlsx does not contain an 'ID' column.")
             return None
+        # Normalize to integers
+        df = df[df["ID"].notna()].copy()
+        df["ID"] = df["ID"].astype(int)
         return df
     except FileNotFoundError:
         st.warning("item_database.xlsx not found in the app directory.")
@@ -60,83 +33,169 @@ def load_item_database():
         st.error(f"Error reading item_database.xlsx: {e}")
         return None
 
-# Session state for table persistence across buttons
+def safe_get(url, params=None):
+    try:
+        return requests.get(url, params=params, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30)
+    except Exception as e:
+        class R:
+            status_code = 0
+            text = str(e)
+            def json(self): return {}
+        return R()
+
+def fetch_products_for_ids(source_ids):
+    """
+    Returns:
+      df_rows: list of dict rows with read-only columns + blank edit columns
+      id_to_manage_stock: dict[int,bool]
+      missing_ids: list[int] that returned 404/403
+    Rules:
+      - For each parent ID in source_ids: include parent row and all its variations.
+      - For each variation ID in source_ids: include variation row (even if parent not in source_ids).
+      - Skip 404/403; collect in missing_ids.
+    """
+    df_rows = []
+    id_to_manage_stock = {}
+    missing_ids = []
+
+    source_id_set = set(int(i) for i in source_ids if pd.notna(i))
+
+    # First pass: fetch each given ID
+    parents_to_expand = set()
+    fetched_products_by_id = {}
+
+    for pid in sorted(source_id_set):
+        r = safe_get(f"{WC_API_URL}/products/{pid}")
+        if r.status_code in (404, 403):
+            missing_ids.append(pid)
+            continue
+        if r.status_code != 200:
+            # Treat non-200 non-404/403 as also skipped, but show info at bottom
+            missing_ids.append(pid)
+            continue
+
+        p = r.json()
+        fetched_products_by_id[p.get("id")] = p
+
+        # Record manage_stock for this item
+        id_to_manage_stock[p.get("id")] = bool(p.get("manage_stock"))
+
+        # Add parent row or simple product row
+        df_rows.append({
+            "ID": p.get("id"),
+            "Parent ID": None if p.get("type") != "variation" else p.get("parent_id"),
+            "Product Name": p.get("name"),
+            "Current Stock": p.get("stock_quantity") or 0,
+            "Sale Price": p.get("sale_price") or "",
+            "Regular Price": p.get("regular_price") or "",
+            "Type": p.get("type") or "simple",
+            "New Sale Price": "",
+            "New Stock Quantity": "",
+        })
+
+        # Track parent IDs to expand variations if the ID is a parent (variable)
+        if p.get("type") == "variable":
+            parents_to_expand.add(p.get("id"))
+
+    # Second pass: if an ID is a parent, fetch all its variations
+    for parent_id in sorted(parents_to_expand):
+        var_page = 1
+        while True:
+            vr = safe_get(
+                f"{WC_API_URL}/products/{parent_id}/variations",
+                params={"per_page": 100, "page": var_page}
+            )
+            if vr.status_code != 200:
+                break
+            variations = vr.json()
+            if not variations:
+                break
+            for v in variations:
+                id_to_manage_stock[v.get("id")] = bool(v.get("manage_stock"))
+                df_rows.append({
+                    "ID": v.get("id"),
+                    "Parent ID": parent_id,
+                    "Product Name": v.get("name") or (fetched_products_by_id.get(parent_id) or {}).get("name"),
+                    "Current Stock": v.get("stock_quantity") or 0,
+                    "Sale Price": v.get("sale_price") or "",
+                    "Regular Price": v.get("regular_price") or "",
+                    "Type": v.get("type") or "variation",
+                    "New Sale Price": "",
+                    "New Stock Quantity": "",
+                })
+            var_page += 1
+
+    # Third pass: Source might contain direct variation IDs too. Ensure they’re present.
+    # (We already added rows for any directly fetched variation above.)
+    # No additional work needed unless you want to re-fetch parent/manage_stock.
+
+    return df_rows, id_to_manage_stock, sorted(missing_ids)
+
+def is_blank(value):
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+def coerce_int(value):
+    if is_blank(value):
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return None
+
+def coerce_price(value):
+    if is_blank(value):
+        return ""
+    s = str(value).strip()
+    return "" if s.lower() == "nan" else s
+
+# Session state
 if "products_df" not in st.session_state:
     st.session_state["products_df"] = None
+if "manage_stock_map" not in st.session_state:
+    st.session_state["manage_stock_map"] = {}
+if "missing_ids" not in st.session_state:
+    st.session_state["missing_ids"] = []
 
-fetch_clicked = st.button("Fetch Product")
+# Controls
+col1, col2 = st.columns([1, 1])
+with col1:
+    refresh_clicked = st.button("Refresh")
+with col2:
+    update_clicked = st.button("Update")
 
-if fetch_clicked and product_id_input:
-    # Validate product ID
-    try:
-        product_id = int(str(product_id_input).strip())
-    except ValueError:
-        st.error("Product ID must be an integer.")
-        st.stop()
+# Refresh pulls IDs from Excel and rebuilds the table
+if refresh_clicked:
+    st.session_state["products_df"] = None
+    st.session_state["manage_stock_map"] = {}
+    st.session_state["missing_ids"] = []
 
-    with st.spinner("Fetching product..."):
-        rows = []
+    db = load_item_database()
+    if db is None or db.empty:
+        st.info("No IDs to fetch from item_database.xlsx.")
+    else:
+        ids = db["ID"].tolist()
+        with st.spinner("Fetching latest data from WooCommerce..."):
+            rows, manage_map, missing_ids = fetch_products_for_ids(ids)
+            if rows:
+                df = pd.DataFrame(rows, columns=[
+                    "ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type",
+                    "New Sale Price", "New Stock Quantity"
+                ])
+                st.session_state["products_df"] = df
+                st.session_state["manage_stock_map"] = manage_map
+                st.session_state["missing_ids"] = missing_ids
+            else:
+                st.info("No products found for the IDs in item_database.xlsx.")
 
-        # Fetch base product
-        resp = requests.get(
-            f"{WC_API_URL}/products/{product_id}",
-            auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
-        )
-
-        if resp.status_code != 200:
-            st.error(f"Error fetching product: {resp.status_code} - {resp.text}")
-        else:
-            p = resp.json()
-            rows.append({
-                "ID": p.get("id"),
-                "Parent ID": None,
-                "Product Name": p.get("name"),
-                "Current Stock": p.get("stock_quantity") or 0,
-                "Sale Price": p.get("sale_price") or "",
-                "Regular Price": p.get("regular_price") or "",
-                "Type": p.get("type") or "simple",
-            })
-
-            # Fetch variations if variable product
-            if p.get("type") == "variable":
-                var_page = 1
-                while True:
-                    vresp = requests.get(
-                        f"{WC_API_URL}/products/{p['id']}/variations",
-                        params={"per_page": 100, "page": var_page},
-                        auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
-                    )
-                    if vresp.status_code != 200:
-                        st.warning(f"Error fetching variations for product {p['id']}: {vresp.status_code} - {vresp.text}")
-                        break
-                    variations = vresp.json()
-                    if not variations:
-                        break
-                    for v in variations:
-                        rows.append({
-                            "ID": v.get("id"),
-                            "Parent ID": p.get("id"),
-                            "Product Name": v.get("name") or p.get("name"),
-                            "Current Stock": v.get("stock_quantity") or 0,
-                            "Sale Price": v.get("sale_price") or "",
-                            "Regular Price": v.get("regular_price") or "",
-                            "Type": v.get("type") or "variation",
-                        })
-                    var_page += 1
-
-            # Build DataFrame with read-only current columns + two editable input columns
-            df = pd.DataFrame(rows, columns=[
-                "ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"
-            ])
-            # Add editable input columns (text boxes)
-            df["New Sale Price"] = ""
-            df["New Stock Quantity"] = ""
-
-            st.session_state["products_df"] = df
-
-# Render editor if we have data
+# Show table if present
 if st.session_state["products_df"] is not None:
-    st.subheader("Product Table")
+    st.subheader("Products (from item_database.xlsx)")
     edited_df = st.data_editor(
         st.session_state["products_df"],
         use_container_width=True,
@@ -148,72 +207,69 @@ if st.session_state["products_df"] is not None:
             "Sale Price": st.column_config.TextColumn("Sale Price"),
             "Regular Price": st.column_config.TextColumn("Regular Price"),
             "Type": st.column_config.TextColumn("Type"),
-            "New Sale Price": st.column_config.TextColumn("New Sale Price", help="Leave blank to skip price update"),
-            "New Stock Quantity": st.column_config.TextColumn("New Stock Quantity", help="Leave blank to skip stock update"),
+            "New Sale Price": st.column_config.TextColumn("New Sale Price", help="Leave blank to skip"),
+            "New Stock Quantity": st.column_config.TextColumn("New Stock Quantity", help="Leave blank to skip"),
         },
         disabled=["ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"],
     )
 
-    # Static table from item_database.xlsx, matched by ID
-    db_df = load_item_database()
-    if db_df is not None and edited_df is not None and not edited_df.empty:
-        try:
-            product_ids = edited_df["ID"].astype(str)
-            db_ids = db_df["ID"].astype(str)
-            static_subset = db_df[db_ids.isin(product_ids)].copy()
-
-            st.subheader("Item Database (from item_database.xlsx)")
-            st.dataframe(static_subset, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error displaying item database: {e}")
-
-    # Update button
-    if st.button("Update"):
-        to_update = edited_df.copy()
-        if to_update.empty:
+    # Update
+    if update_clicked:
+        if edited_df is None or edited_df.empty:
             st.info("No rows to update.")
         else:
-            updated = 0
+            updated_count = 0
             failed = []
+            stock_not_managed = []
 
-            for _, row in to_update.iterrows():
-                new_price = coerce_price_or_empty(row.get("New Sale Price"))
-                new_stock = coerce_int_or_none(row.get("New Stock Quantity"))
+            for _, row in edited_df.iterrows():
+                prod_id = int(row["ID"])
+                parent_id = row.get("Parent ID")
+                parent_missing = parent_id is None or (isinstance(parent_id, float) and math.isnan(parent_id)) or parent_id == ""
+                new_price = coerce_price(row.get("New Sale Price"))
+                new_stock = coerce_int(row.get("New Stock Quantity"))
 
                 payload = {}
 
-                # Only include fields user provided
                 if new_price != "":
                     payload["sale_price"] = new_price
+
                 if new_stock is not None:
-                    payload["manage_stock"] = True
-                    payload["stock_quantity"] = new_stock
+                    manage_stock = bool(st.session_state["manage_stock_map"].get(prod_id, False))
+                    if not manage_stock:
+                        stock_not_managed.append(prod_id)
+                    else:
+                        payload["stock_quantity"] = new_stock
+                        # Do NOT force manage_stock True; follow your rule to only update if already managed.
 
                 # Skip if nothing to update
                 if not payload:
                     continue
 
-                # Choose correct endpoint (variation vs product)
-                parent_id = row.get("Parent ID")
-                is_parent_missing = (
-                    parent_id is None or
-                    (isinstance(parent_id, float) and math.isnan(parent_id)) or
-                    parent_id == ""
-                )
+                # Choose endpoint for product vs variation
                 target_url = (
-                    f"{WC_API_URL}/products/{int(row['ID'])}"
-                    if is_parent_missing
-                    else f"{WC_API_URL}/products/{int(parent_id)}/variations/{int(row['ID'])}"
+                    f"{WC_API_URL}/products/{prod_id}"
+                    if parent_missing
+                    else f"{WC_API_URL}/products/{int(parent_id)}/variations/{prod_id}"
                 )
 
-                resp = requests.put(target_url, json=payload, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET))
+                try:
+                    r = requests.put(target_url, json=payload, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30)
+                    if r.status_code in (200, 201):
+                        updated_count += 1
+                    else:
+                        failed.append(f"ID {prod_id} (HTTP {r.status_code}): {r.text[:300]}")
+                except Exception as e:
+                    failed.append(f"ID {prod_id} (exception): {str(e)}")
 
-                if resp.status_code in (200, 201):
-                    updated += 1
-                else:
-                    failed.append(f"ID {row['ID']} (HTTP {resp.status_code}): {resp.text[:300]}")
-
-            if updated:
-                st.success(f"Updated {updated} item(s) successfully.")
+            if updated_count:
+                st.success(f"Updated {updated_count} item(s) successfully.")
+            if stock_not_managed:
+                st.error("Stock not managed for ID(s): " + ", ".join(str(i) for i in sorted(set(stock_not_managed))))
             if failed:
                 st.error("Some updates failed:\n" + "\n".join(failed))
+
+# Missing IDs summary (from last refresh)
+if st.session_state["missing_ids"]:
+    st.subheader("IDs not found on website")
+    st.write(", ".join(str(i) for i in st.session_state["missing_ids"]))
