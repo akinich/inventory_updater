@@ -2,16 +2,18 @@ import streamlit as st
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="WooCommerce Product Lookup", layout="wide")
-st.title("WooCommerce Product Lookup by ID")
+st.set_page_config(page_title="WooCommerce Product Lookup & Update", layout="wide")
+st.title("WooCommerce Product Lookup & Update by ID")
 
 # WooCommerce API credentials
 WC_API_URL = st.secrets.get("WC_API_URL", "https://sustenance.co.in/wp-json/wc/v3")
 WC_CONSUMER_KEY = st.secrets.get("WC_CONSUMER_KEY")
 WC_CONSUMER_SECRET = st.secrets.get("WC_CONSUMER_SECRET")
 
-# Input for product ID
-product_id = st.text_input("Enter Product ID:")
+# ------------------- FETCH PRODUCT -------------------
+st.header("Fetch Product Details")
+
+product_id = st.text_input("Enter Product ID to Fetch:")
 
 if st.button("Fetch Product") and product_id:
     with st.spinner("Fetching product..."):
@@ -27,7 +29,6 @@ if st.button("Fetch Product") and product_id:
             st.error(f"Error fetching product: {response.status_code} - {response.text}")
         else:
             p = response.json()
-            # Base product info
             base_info = {
                 "ID": p.get("id"),
                 "Parent ID": None,
@@ -69,9 +70,46 @@ if st.button("Fetch Product") and product_id:
 
                     var_page += 1
 
-            # Display results
             if all_rows:
                 df = pd.DataFrame(all_rows)
                 st.dataframe(df, use_container_width=True)
             else:
                 st.info("No product found.")
+
+# ------------------- UPDATE PRODUCT -------------------
+st.header("Update Stock & Sale Price")
+
+update_product_id = st.text_input("Enter Product/Variation ID to Update:")
+new_stock = st.text_input("Enter New Stock Quantity:")
+new_sale_price = st.text_input("Enter New Sale Price (leave blank if no change)")
+
+if st.button("Update Product"):
+    if not update_product_id:
+        st.error("Please enter a Product/Variation ID to update.")
+    else:
+        data = {}
+        if new_stock:
+            try:
+                data["stock_quantity"] = int(new_stock)
+            except ValueError:
+                st.error("Stock must be an integer.")
+        if new_sale_price:
+            try:
+                data["sale_price"] = str(new_sale_price)
+            except ValueError:
+                st.error("Sale Price must be a number.")
+
+        if data:
+            update_resp = requests.put(
+                f"{WC_API_URL}/products/{update_product_id}",
+                json=data,
+                auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+            )
+
+            if update_resp.status_code in [200, 201]:
+                st.success(f"Product {update_product_id} updated successfully.")
+                st.json(update_resp.json())
+            else:
+                st.error(f"Failed to update: {update_resp.status_code} - {update_resp.text}")
+        else:
+            st.info("No changes to update.")
