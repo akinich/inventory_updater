@@ -1,3 +1,6 @@
+Here’s the full updated script with the restructured read-only table, two editable input columns for new values, correct variation updates, and a static table loaded from `item_database.xlsx` filtered by `ID`.
+
+```python
 import streamlit as st
 import requests
 import pandas as pd
@@ -44,6 +47,21 @@ def coerce_price_or_empty(value):
     if s.lower() == "nan":
         return ""
     return s
+
+@st.cache_data(show_spinner=False)
+def load_item_database():
+    try:
+        df = pd.read_excel("item_database.xlsx")
+        if "ID" not in df.columns:
+            st.warning("item_database.xlsx does not contain an 'ID' column.")
+            return None
+        return df
+    except FileNotFoundError:
+        st.warning("item_database.xlsx not found in the app directory.")
+        return None
+    except Exception as e:
+        st.error(f"Error reading item_database.xlsx: {e}")
+        return None
 
 # Session state for table persistence across buttons
 if "products_df" not in st.session_state:
@@ -136,8 +154,21 @@ if st.session_state["products_df"] is not None:
             "New Sale Price": st.column_config.TextColumn("New Sale Price", help="Leave blank to skip price update"),
             "New Stock Quantity": st.column_config.TextColumn("New Stock Quantity", help="Leave blank to skip stock update"),
         },
-    disabled=["ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"],
+        disabled=["ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"],
     )
+
+    # Static table from item_database.xlsx, matched by ID
+    db_df = load_item_database()
+    if db_df is not None and edited_df is not None and not edited_df.empty:
+        try:
+            product_ids = edited_df["ID"].astype(str)
+            db_ids = db_df["ID"].astype(str)
+            static_subset = db_df[db_ids.isin(product_ids)].copy()
+
+            st.subheader("Item Database (from item_database.xlsx)")
+            st.dataframe(static_subset, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error displaying item database: {e}")
 
     # Update button
     if st.button("Update"):
@@ -167,9 +198,14 @@ if st.session_state["products_df"] is not None:
 
                 # Choose correct endpoint (variation vs product)
                 parent_id = row.get("Parent ID")
+                is_parent_missing = (
+                    parent_id is None or
+                    (isinstance(parent_id, float) and math.isnan(parent_id)) or
+                    parent_id == ""
+                )
                 target_url = (
                     f"{WC_API_URL}/products/{int(row['ID'])}"
-                    if (parent_id is None or (isinstance(parent_id, float) and math.isnan(parent_id)) or parent_id == "")
+                    if is_parent_missing
                     else f"{WC_API_URL}/products/{int(parent_id)}/variations/{int(row['ID'])}"
                 )
 
@@ -184,3 +220,4 @@ if st.session_state["products_df"] is not None:
                 st.success(f"Updated {updated} item(s) successfully.")
             if failed:
                 st.error("Some updates failed:\n" + "\n".join(failed))
+```
