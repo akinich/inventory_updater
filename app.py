@@ -11,12 +11,11 @@ WC_API_URL = st.secrets.get("WC_API_URL", "https://sustenance.co.in/wp-json/wc/v
 WC_CONSUMER_KEY = st.secrets.get("WC_CONSUMER_KEY")
 WC_CONSUMER_SECRET = st.secrets.get("WC_CONSUMER_SECRET")
 
-# Secrets validation
+# Guard: secrets required
 if not WC_CONSUMER_KEY or not WC_CONSUMER_SECRET:
     st.error("WooCommerce credentials are missing. Please set WC_CONSUMER_KEY and WC_CONSUMER_SECRET in secrets.")
     st.stop()
 
-# ------------------- FETCH PRODUCT -------------------
 st.header("Fetch Product Details")
 
 product_id_input = st.text_input("Enter Product ID:")
@@ -34,7 +33,7 @@ def coerce_int_or_none(value):
     try:
         if is_nan_or_empty(value):
             return None
-        return int(float(value))
+        return int(float(str(value).strip()))
     except Exception:
         return None
 
@@ -46,7 +45,13 @@ def coerce_price_or_empty(value):
         return ""
     return s
 
-if st.button("Fetch Product") and product_id_input:
+# Session state for table persistence across buttons
+if "products_df" not in st.session_state:
+    st.session_state["products_df"] = None
+
+fetch_clicked = st.button("Fetch Product")
+
+if fetch_clicked and product_id_input:
     # Validate product ID
     try:
         product_id = int(str(product_id_input).strip())
@@ -55,52 +60,45 @@ if st.button("Fetch Product") and product_id_input:
         st.stop()
 
     with st.spinner("Fetching product..."):
-        all_rows = []
+        rows = []
 
         # Fetch base product
-        response = requests.get(
+        resp = requests.get(
             f"{WC_API_URL}/products/{product_id}",
             auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
         )
 
-        if response.status_code != 200:
-            st.error(f"Error fetching product: {response.status_code} - {response.text}")
+        if resp.status_code != 200:
+            st.error(f"Error fetching product: {resp.status_code} - {resp.text}")
         else:
-            p = response.json()
-            base_info = {
-                "Update?": True,
+            p = resp.json()
+            rows.append({
                 "ID": p.get("id"),
                 "Parent ID": None,
                 "Product Name": p.get("name"),
                 "Current Stock": p.get("stock_quantity") or 0,
                 "Sale Price": p.get("sale_price") or "",
                 "Regular Price": p.get("regular_price") or "",
-                "Type": p.get("type"),
-                "Manage Stock": bool(p.get("manage_stock")),
-            }
-            all_rows.append(base_info)
+                "Type": p.get("type") or "simple",
+            })
 
             # Fetch variations if variable product
             if p.get("type") == "variable":
                 var_page = 1
                 while True:
-                    var_resp = requests.get(
+                    vresp = requests.get(
                         f"{WC_API_URL}/products/{p['id']}/variations",
                         params={"per_page": 100, "page": var_page},
                         auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
                     )
-
-                    if var_resp.status_code != 200:
-                        st.warning(f"Error fetching variations for product {p['id']}: {var_resp.status_code} - {var_resp.text}")
+                    if vresp.status_code != 200:
+                        st.warning(f"Error fetching variations for product {p['id']}: {vresp.status_code} - {vresp.text}")
                         break
-
-                    variations = var_resp.json()
+                    variations = vresp.json()
                     if not variations:
                         break
-
                     for v in variations:
-                        var_info = {
-                            "Update?": True,
+                        rows.append({
                             "ID": v.get("id"),
                             "Parent ID": p.get("id"),
                             "Product Name": v.get("name") or p.get("name"),
@@ -108,84 +106,81 @@ if st.button("Fetch Product") and product_id_input:
                             "Sale Price": v.get("sale_price") or "",
                             "Regular Price": v.get("regular_price") or "",
                             "Type": v.get("type") or "variation",
-                            "Manage Stock": bool(v.get("manage_stock")),
-                        }
-                        all_rows.append(var_info)
-
+                        })
                     var_page += 1
 
-            if all_rows:
-                df = pd.DataFrame(all_rows)
+            # Build DataFrame with read-only current columns + two editable input columns
+            df = pd.DataFrame(rows, columns=[
+                "ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"
+            ])
+            # Add editable input columns (text boxes)
+            df["New Sale Price"] = ""
+            df["New Stock Quantity"] = ""
 
-                st.subheader("Product Table (Edit Stock & Sale Price)")
-                edited_df = st.data_editor(
-                    df,
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    column_config={
-                        "Update?": st.column_config.CheckboxColumn("Update?", help="Uncheck to skip updating this row"),
-                        "ID": st.column_config.TextColumn("ID"),
-                        "Parent ID": st.column_config.TextColumn("Parent ID"),
-                        "Product Name": st.column_config.TextColumn("Product Name"),
-                        "Regular Price": st.column_config.TextColumn("Regular Price"),
-                        "Current Stock": st.column_config.NumberColumn("Current Stock"),
-                        "Sale Price": st.column_config.TextColumn("Sale Price"),
-                        "Type": st.column_config.TextColumn("Type"),
-                        "Manage Stock": st.column_config.CheckboxColumn("Manage Stock"),
-                    },
-                    disabled=["ID", "Parent ID", "Product Name", "Regular Price", "Type"],
+            st.session_state["products_df"] = df
+
+# Render editor if we have data
+if st.session_state["products_df"] is not None:
+    st.subheader("Product Table")
+    edited_df = st.data_editor(
+        st.session_state["products_df"],
+        use_container_width=True,
+        column_config={
+            "ID": st.column_config.TextColumn("ID"),
+            "Parent ID": st.column_config.TextColumn("Parent ID"),
+            "Product Name": st.column_config.TextColumn("Product Name"),
+            "Current Stock": st.column_config.TextColumn("Current Stock"),
+            "Sale Price": st.column_config.TextColumn("Sale Price"),
+            "Regular Price": st.column_config.TextColumn("Regular Price"),
+            "Type": st.column_config.TextColumn("Type"),
+            "New Sale Price": st.column_config.TextColumn("New Sale Price", help="Leave blank to skip price update"),
+            "New Stock Quantity": st.column_config.TextColumn("New Stock Quantity", help="Leave blank to skip stock update"),
+        },
+    disabled=["ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"],
+    )
+
+    # Update button
+    if st.button("Update"):
+        to_update = edited_df.copy()
+        if to_update.empty:
+            st.info("No rows to update.")
+        else:
+            updated = 0
+            failed = []
+
+            for _, row in to_update.iterrows():
+                new_price = coerce_price_or_empty(row.get("New Sale Price"))
+                new_stock = coerce_int_or_none(row.get("New Stock Quantity"))
+
+                payload = {}
+
+                # Only include fields user provided
+                if new_price != "":
+                    payload["sale_price"] = new_price
+                if new_stock is not None:
+                    payload["manage_stock"] = True
+                    payload["stock_quantity"] = new_stock
+
+                # Skip if nothing to update
+                if not payload:
+                    continue
+
+                # Choose correct endpoint (variation vs product)
+                parent_id = row.get("Parent ID")
+                target_url = (
+                    f"{WC_API_URL}/products/{int(row['ID'])}"
+                    if (parent_id is None or (isinstance(parent_id, float) and math.isnan(parent_id)) or parent_id == "")
+                    else f"{WC_API_URL}/products/{int(parent_id)}/variations/{int(row['ID'])}"
                 )
 
-                # ------------------- UPDATE PRODUCTS -------------------
-                if st.button("Update Selected Products"):
-                    rows_to_update = edited_df[edited_df["Update?"] == True]
-                    if rows_to_update.empty:
-                        st.info("No rows selected for update.")
-                    else:
-                        updated_count = 0
-                        failed = []
+                resp = requests.put(target_url, json=payload, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET))
 
-                        for _, row in rows_to_update.iterrows():
-                            stock_val = coerce_int_or_none(row.get("Current Stock"))
-                            sale_price_val = coerce_price_or_empty(row.get("Sale Price"))
-                            manage_stock_val = bool(row.get("Manage Stock"))
+                if resp.status_code in (200, 201):
+                    updated += 1
+                else:
+                    failed.append(f"ID {row['ID']} (HTTP {resp.status_code}): {resp.text[:300]}")
 
-                            product_data = {}
-
-                            if stock_val is not None:
-                                product_data["manage_stock"] = True if manage_stock_val or stock_val is not None else False
-                                product_data["stock_quantity"] = stock_val
-
-                            if sale_price_val != "":
-                                product_data["sale_price"] = sale_price_val
-                            else:
-                                # Send empty string to clear sale price explicitly
-                                product_data["sale_price"] = ""
-
-                            # Choose endpoint: product vs variation
-                            parent_id = row.get("Parent ID")
-                            target_url = (
-                                f"{WC_API_URL}/products/{int(row['ID'])}"
-                                if pd.isna(parent_id) or parent_id in (None, "")
-                                else f"{WC_API_URL}/products/{int(parent_id)}/variations/{int(row['ID'])}"
-                            )
-
-                            resp = requests.put(
-                                target_url,
-                                json=product_data,
-                                auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
-                            )
-
-                            if resp.status_code in [200, 201]:
-                                updated_count += 1
-                            else:
-                                failed.append(
-                                    f"ID {row['ID']} (HTTP {resp.status_code}): {resp.text[:300]}"
-                                )
-
-                        if updated_count:
-                            st.success(f"Updated {updated_count} product(s) successfully!")
-                        if failed:
-                            st.error("Some updates failed:\n" + "\n".join(failed))
-            else:
-                st.info("No product found.")
+            if updated:
+                st.success(f"Updated {updated} item(s) successfully.")
+            if failed:
+                st.error("Some updates failed:\n" + "\n".join(failed))
