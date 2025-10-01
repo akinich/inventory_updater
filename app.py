@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import math
+import openpyxl  # required for reading .xlsx via pandas
 
 st.set_page_config(page_title="WooCommerce Product Lookup & Update", layout="wide")
 st.title("WooCommerce Product Lookup & Inline Update")
@@ -18,16 +19,18 @@ if not WC_CONSUMER_KEY or not WC_CONSUMER_SECRET:
 @st.cache_data(show_spinner=False)
 def load_item_database():
     try:
-        df = pd.read_excel("item_database.xlsx")
+        df = pd.read_excel("item_database.xlsx", engine="openpyxl")
         if "ID" not in df.columns:
             st.warning("item_database.xlsx does not contain an 'ID' column.")
             return None
-        # Normalize to integers
         df = df[df["ID"].notna()].copy()
         df["ID"] = df["ID"].astype(int)
         return df
     except FileNotFoundError:
         st.warning("item_database.xlsx not found in the app directory.")
+        return None
+    except ImportError as e:
+        st.error(f"Excel reading requires openpyxl. Please install it. Error: {e}")
         return None
     except Exception as e:
         st.error(f"Error reading item_database.xlsx: {e}")
@@ -44,23 +47,12 @@ def safe_get(url, params=None):
         return R()
 
 def fetch_products_for_ids(source_ids):
-    """
-    Returns:
-      df_rows: list of dict rows with read-only columns + blank edit columns
-      id_to_manage_stock: dict[int,bool]
-      missing_ids: list[int] that returned 404/403
-    Rules:
-      - For each parent ID in source_ids: include parent row and all its variations.
-      - For each variation ID in source_ids: include variation row (even if parent not in source_ids).
-      - Skip 404/403; collect in missing_ids.
-    """
     df_rows = []
     id_to_manage_stock = {}
     missing_ids = []
 
     source_id_set = set(int(i) for i in source_ids if pd.notna(i))
 
-    # First pass: fetch each given ID
     parents_to_expand = set()
     fetched_products_by_id = {}
 
@@ -70,17 +62,13 @@ def fetch_products_for_ids(source_ids):
             missing_ids.append(pid)
             continue
         if r.status_code != 200:
-            # Treat non-200 non-404/403 as also skipped, but show info at bottom
             missing_ids.append(pid)
             continue
 
         p = r.json()
         fetched_products_by_id[p.get("id")] = p
-
-        # Record manage_stock for this item
         id_to_manage_stock[p.get("id")] = bool(p.get("manage_stock"))
 
-        # Add parent row or simple product row
         df_rows.append({
             "ID": p.get("id"),
             "Parent ID": None if p.get("type") != "variation" else p.get("parent_id"),
@@ -93,11 +81,9 @@ def fetch_products_for_ids(source_ids):
             "New Stock Quantity": "",
         })
 
-        # Track parent IDs to expand variations if the ID is a parent (variable)
         if p.get("type") == "variable":
             parents_to_expand.add(p.get("id"))
 
-    # Second pass: if an ID is a parent, fetch all its variations
     for parent_id in sorted(parents_to_expand):
         var_page = 1
         while True:
@@ -125,10 +111,6 @@ def fetch_products_for_ids(source_ids):
                 })
             var_page += 1
 
-    # Third pass: Source might contain direct variation IDs too. Ensure they’re present.
-    # (We already added rows for any directly fetched variation above.)
-    # No additional work needed unless you want to re-fetch parent/manage_stock.
-
     return df_rows, id_to_manage_stock, sorted(missing_ids)
 
 def is_blank(value):
@@ -154,7 +136,6 @@ def coerce_price(value):
     s = str(value).strip()
     return "" if s.lower() == "nan" else s
 
-# Session state
 if "products_df" not in st.session_state:
     st.session_state["products_df"] = None
 if "manage_stock_map" not in st.session_state:
@@ -162,14 +143,12 @@ if "manage_stock_map" not in st.session_state:
 if "missing_ids" not in st.session_state:
     st.session_state["missing_ids"] = []
 
-# Controls
 col1, col2 = st.columns([1, 1])
 with col1:
     refresh_clicked = st.button("Refresh")
 with col2:
     update_clicked = st.button("Update")
 
-# Refresh pulls IDs from Excel and rebuilds the table
 if refresh_clicked:
     st.session_state["products_df"] = None
     st.session_state["manage_stock_map"] = {}
@@ -193,7 +172,6 @@ if refresh_clicked:
             else:
                 st.info("No products found for the IDs in item_database.xlsx.")
 
-# Show table if present
 if st.session_state["products_df"] is not None:
     st.subheader("Products (from item_database.xlsx)")
     edited_df = st.data_editor(
@@ -213,7 +191,6 @@ if st.session_state["products_df"] is not None:
         disabled=["ID", "Parent ID", "Product Name", "Current Stock", "Sale Price", "Regular Price", "Type"],
     )
 
-    # Update
     if update_clicked:
         if edited_df is None or edited_df.empty:
             st.info("No rows to update.")
@@ -240,13 +217,10 @@ if st.session_state["products_df"] is not None:
                         stock_not_managed.append(prod_id)
                     else:
                         payload["stock_quantity"] = new_stock
-                        # Do NOT force manage_stock True; follow your rule to only update if already managed.
 
-                # Skip if nothing to update
                 if not payload:
                     continue
 
-                # Choose endpoint for product vs variation
                 target_url = (
                     f"{WC_API_URL}/products/{prod_id}"
                     if parent_missing
@@ -269,7 +243,6 @@ if st.session_state["products_df"] is not None:
             if failed:
                 st.error("Some updates failed:\n" + "\n".join(failed))
 
-# Missing IDs summary (from last refresh)
 if st.session_state["missing_ids"]:
     st.subheader("IDs not found on website")
     st.write(", ".join(str(i) for i in st.session_state["missing_ids"]))
